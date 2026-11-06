@@ -28,7 +28,7 @@ if "crs_datasets" not in st.session_state:
 
 
 # ==============================================================================
-# UTILIDADES PARA ESCALAS DE COLOR EN NOTACIÓN NORMAL (Ω·m)
+# UTILIDADES PARA ESCALAS DE COLOR Y AUTO-LIMPIEZA ESTADÍSTICA
 # ==============================================================================
 def generar_ticks_ohm_m(r_min, r_max, n_ticks=8):
     """
@@ -38,7 +38,6 @@ def generar_ticks_ohm_m(r_min, r_max, n_ticks=8):
     r_min = max(0.1, float(r_min))
     r_max = max(r_min * 1.5, float(r_max))
 
-    # Candidatos clásicos de geofísica fáciles de leer
     base_steps = [1, 1.5, 2, 3, 5, 7.5]
     candidates = []
     for exp in range(-1, 5):
@@ -50,13 +49,39 @@ def generar_ticks_ohm_m(r_min, r_max, n_ticks=8):
     if len(candidates) < 4:
         vals = np.geomspace(r_min, r_max, n_ticks)
     else:
-        # Asegurar que incluya extremos aproximados
         vals = [r_min] + candidates + [r_max]
         vals = np.unique(np.round(vals, 1))
 
     tick_vals_log = np.log10(vals)
     tick_text = [f"{v:g} Ω·m" if v >= 10 else f"{v:.1f} Ω·m" for v in vals]
     return tick_vals_log, tick_text
+
+
+def calcular_autolimpieza_iqr(rhoa_array, factor_iqr=1.5):
+    """
+    Calcula umbrales óptimos de limpieza usando el Rango Intercuartílico (IQR)
+    sobre log10(rhoa) para eliminar picos aberrantes conservando la estructura geológica.
+    """
+    rhoa_pos = rhoa_array[rhoa_array > 0]
+    log_r = np.log10(rhoa_pos)
+
+    q25, q75 = np.percentile(log_r, [25, 75])
+    iqr = q75 - q25
+
+    # Límites estadísticos Tukey en escala logarítmica
+    low_log = q25 - (factor_iqr * iqr)
+    high_log = q75 + (factor_iqr * iqr)
+
+    r_min_sug = max(float(np.min(rhoa_pos)), float(10 ** low_log))
+    r_max_sug = min(float(np.max(rhoa_pos)), float(10 ** high_log))
+
+    r_min_sug = float(np.floor(r_min_sug * 100.0) / 100.0)
+    r_max_sug = float(np.ceil(r_max_sug * 100.0) / 100.0)
+
+    mask_out = (rhoa_array < r_min_sug) | (rhoa_array > r_max_sug)
+    n_removidos = int(np.sum(mask_out))
+
+    return r_min_sug, r_max_sug, n_removidos
 
 
 # ==============================================================================
@@ -203,8 +228,7 @@ def ejecutar_inversion_tre(
     _data_filtered, section_id, n_valid, lam, z_weight, robust_data, blocky_model, max_iter, para_dx, max_depth
 ):
     """
-    Ejecuta la inversión 2D en PyGIMLi y devuelve también resistividad interpolada
-    a los nodos (Gouraud) para que los gráficos 2D y 3D se vean suaves como en los libros.
+    Ejecuta la inversión 2D en PyGIMLi y devuelve resistividad por celda y por vértice.
     """
     mgr = ert.ERTManager(_data_filtered, verbose=False)
 
@@ -228,7 +252,6 @@ def ejecutar_inversion_tre(
     res_arr = np.array(model_res)
     cov_arr = np.array(coverage)
 
-    # Interpolar resistividad y cobertura de celdas a vértices (suavizado Gouraud)
     node_res = np.array(mt.cellDataToNodeData(mesh_2d, res_arr))
     node_cov = np.array(mt.cellDataToNodeData(mesh_2d, cov_arr))
 
@@ -271,28 +294,41 @@ def ejecutar_inversion_tre(
     )
 
 
-def interpolar_malla_suave_2d(centers_2d, res_arr, cov_arr, elec_d, elec_z, z_offset, cov_threshold, nx=220, nz=90):
+def interpolar_malla_suave_2d(
+    centers_2d, res_arr, cov_arr, elec_d, elec_z, z_offset, cov_threshold, usar_recorte_doi=False, nx=240, nz=120
+):
     """
     Interpola los centroides de elementos finitos hacia una malla 2D regular suave
-    (Estilo EarthImager / RES2DINV) respetando la topografía y el recorte DOI.
+    mostrando el trapecio completo hasta la profundidad máxima de la malla.
     """
     d_pts = centers_2d[:, 0]
     z_pts = centers_2d[:, 1] + z_offset
 
-    # Crear grilla regular 2D
-    d_grid = np.linspace(elec_d.min(), elec_d.max(), nx)
-    z_min_valid = z_pts[cov_arr >= cov_threshold].min() if np.any(cov_arr >= cov_threshold) else z_pts.min()
-    z_max_valid = (elec_z + z_offset).max()
-    z_grid = np.linspace(z_min_valid, z_max_valid, nz)
+    d_min, d_max = elec_d.min(), elec_d.max()
+    d_grid = np.linspace(d_min, d_max, nx)
+
+    z_min_mesh = z_pts.min()
+    z_max_mesh = (elec_z + z_offset).max()
+    z_grid = np.linspace(z_min_mesh, z_max_mesh, nz)
     D, Z = np.meshgrid(d_grid, z_grid)
 
-    # Interpolar log10(rho) y cobertura usando interpolación lineal suave
-    log_rho_grid = griddata((d_pts, z_pts), np.log10(res_arr), (D, Z), method="linear")
-    cov_grid = griddata((d_pts, z_pts), cov_arr, (D, Z), method="linear")
+    log_rho_lin = griddata((d_pts, z_pts), np.log10(res_arr), (D, Z), method="linear")
+    log_rho_near = griddata((d_pts, z_pts), np.log10(res_arr), (D, Z), method="nearest")
+    log_rho_grid = np.where(np.isnan(log_rho_lin), log_rho_near, log_rho_lin)
 
-    # Enmascarar por encima de la superficie topográfica y por debajo del DOI
+    cov_grid = griddata((d_pts, z_pts), cov_arr, (D, Z), method="nearest")
+
     z_topo_interp = np.interp(d_grid, elec_d, elec_z + z_offset)
-    mask_invalid = (Z > z_topo_interp[None, :]) | (cov_grid < cov_threshold) | np.isnan(cov_grid)
+    Prof_bajo_terreno = z_topo_interp[None, :] - Z
+
+    dist_borde_izq = D - d_min
+    dist_borde_der = d_max - D
+    mask_trapezoid = (Prof_bajo_terreno > dist_borde_izq * 1.15) | (Prof_bajo_terreno > dist_borde_der * 1.15)
+
+    mask_invalid = (Z > z_topo_interp[None, :]) | mask_trapezoid
+    if usar_recorte_doi:
+        mask_invalid = mask_invalid | (cov_grid < cov_threshold)
+
     log_rho_grid[mask_invalid] = np.nan
     rho_grid = 10 ** log_rho_grid
 
@@ -319,7 +355,7 @@ def proyectar_2d_a_utm(coords_2d, x_ini, y_ini, x_fin, y_fin, z_offset=0.0):
 st.title("⚡ Módulo 1: Procesamiento e Inversión 2D/3D de TRE")
 st.markdown(
     "Carga archivos crudos de resistividad eléctrica (**AGI SuperSting .stg / .crs**, "
-    "**RES2DINV .dat**, **.ohm**), aplica control de calidad, invierte con elementos finitos "
+    "**RES2DINV .dat**, **.ohm**), aplica auto-limpieza o filtrado manual, invierte con elementos finitos "
     "y visualiza secciones suavizadas en notación normal (**Ω·m**)."
 )
 
@@ -363,7 +399,7 @@ with st.sidebar:
 
 if not seccion_activa:
     st.info(
-        "👈 Sube tu archivo **SQCACH.stg** en la barra lateral "
+        "👈 Sube tu archivo **.stg** en la barra lateral "
         "o haz clic en **'Generar Línea Sintética de Prueba'** para iniciar."
     )
     st.stop()
@@ -380,45 +416,105 @@ tab_qc, tab_inv, tab_3d = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: CONTROL DE CALIDAD Y GEORREFERENCIACIÓN UTM
+# PESTAÑA 1: CONTROL DE CALIDAD, AUTO-LIMPIEZA Y COMPARACIÓN VISUAL
 # ------------------------------------------------------------------------------
 with tab_qc:
-    col_qc, col_geo = st.columns([1.25, 1])
+    col_qc, col_geo = st.columns([1.3, 1])
 
     elec_pos = np.array([[p.x(), p.y(), p.z()] for p in data_raw.sensorPositions()])
     elec_d = elec_pos[:, 0]
     elec_z = elec_pos[:, 1] if np.ptp(elec_pos[:, 1]) > np.ptp(elec_pos[:, 2]) else elec_pos[:, 2]
 
+    # 1. Valores originales exactos del archivo crudo
+    rhoa_orig = np.array(data_raw["rhoa"])
+    rhoa_min_raw = float(np.floor(np.min(rhoa_orig) * 100.0) / 100.0)
+    rhoa_max_raw = float(np.ceil(np.max(rhoa_orig) * 100.0) / 100.0)
+    rhoa_med_raw = float(np.median(rhoa_orig))
+
+    # 2. Calcular propuesta de Auto-Limpieza estadística (IQR sobre Log10)
+    rhoa_min_auto, rhoa_max_auto, n_auto_rem = calcular_autolimpieza_iqr(rhoa_orig, factor_iqr=1.5)
+    pct_auto_rem = (n_auto_rem / len(rhoa_orig)) * 100.0 if len(rhoa_orig) > 0 else 0.0
+
+    # 3. Inicializar en session_state con los valores originales cuando se sube el archivo
+    key_rmin = f"rmin_{seccion_activa}"
+    key_rmax = f"rmax_{seccion_activa}"
+    key_err = f"err_{seccion_activa}"
+
+    if key_rmin not in st.session_state:
+        st.session_state[key_rmin] = rhoa_min_raw
+    if key_rmax not in st.session_state:
+        st.session_state[key_rmax] = rhoa_max_raw
+    if key_err not in st.session_state:
+        st.session_state[key_err] = 3.0
+
     with col_qc:
-        st.subheader(f"Estadísticas de Campo: {seccion_activa}")
+        st.subheader(f"Estadísticas Crudas Originales: {seccion_activa}")
         m1, m2, m3 = st.columns(3)
         m1.metric("Electrodos", data_raw.sensorCount())
         m2.metric("Cuadrupolos (Lecturas)", data_raw.size())
         m3.metric("Longitud de Línea", f"{elec_d.max() - elec_d.min():.1f} m")
 
-        with st.form(key=f"form_qc_{seccion_activa}"):
-            st.markdown("**Filtros de Limpieza Pre-Inversión**")
-            c_min, c_max = st.columns(2)
-            rhoa_min = c_min.number_input("Resistividad Aparente Mín (Ω·m)", value=1.5, min_value=0.01)
-            rhoa_max = c_max.number_input("Resistividad Aparente Máx (Ω·m)", value=400.0, min_value=10.0)
-            err_est = st.slider("Error relativo base para inversión (%)", 1.0, 15.0, 4.5, 0.5)
-            st.form_submit_button("Aplicar Filtros y Actualizar Pseudosección")
+        o1, o2, o3 = st.columns(3)
+        o1.metric("ρa Mínima Original", f"{np.min(rhoa_orig):.2f} Ω·m")
+        o2.metric("ρa Máxima Original", f"{np.max(rhoa_orig):.2f} Ω·m")
+        o3.metric("ρa Mediana Original", f"{rhoa_med_raw:.2f} Ω·m")
 
+        # Recuadro de sugerencia de Auto-Limpieza con botones de acción rápida
+        st.info(
+            f"💡 **Diagnóstico de Auto-Limpieza (IQR Log-Normal):** Se sugiere acotar entre "
+            f"**{rhoa_min_auto:.2f} Ω·m** y **{rhoa_max_auto:.2f} Ω·m** "
+            f"(descarta **{n_auto_rem}** lecturas atípicas [{pct_auto_rem:.1f}%] y conserva el "
+            f"**{100.0 - pct_auto_rem:.1f}%** de tus datos)."
+        )
+
+        btn_c1, btn_c2 = st.columns(2)
+        if btn_c1.button("✨ Aplicar Auto-Limpieza Sugerida", type="primary", use_container_width=True, key=f"btn_auto_{seccion_activa}"):
+            st.session_state[key_rmin] = rhoa_min_auto
+            st.session_state[key_rmax] = rhoa_max_auto
+            st.session_state[key_err] = 4.5
+            st.rerun()
+
+        if btn_c2.button("🔄 Restaurar Datos Originales", use_container_width=True, key=f"btn_orig_{seccion_activa}"):
+            st.session_state[key_rmin] = rhoa_min_raw
+            st.session_state[key_rmax] = rhoa_max_raw
+            st.session_state[key_err] = 3.0
+            st.rerun()
+
+        # Controles manuales (siempre disponibles por si el usuario prefiere ajustar a mano)
+        with st.form(key=f"form_qc_{seccion_activa}"):
+            st.markdown("**Ajuste Manual de Filtros Pre-Inversión**")
+            c_min, c_max = st.columns(2)
+            rhoa_min = c_min.number_input(
+                "Resistividad Aparente Mín (Ω·m)",
+                min_value=0.0,
+                max_value=float(rhoa_max_raw),
+                format="%.2f",
+                key=key_rmin,
+            )
+            rhoa_max = c_max.number_input(
+                "Resistividad Aparente Máx (Ω·m)",
+                min_value=0.01,
+                max_value=max(float(rhoa_max_raw) * 2.0, 100000.0),
+                format="%.2f",
+                key=key_rmax,
+            )
+            err_est = st.slider(
+                "Error relativo base para inversión (%)",
+                1.0, 15.0,
+                step=0.5,
+                key=key_err,
+            )
+            st.form_submit_button("Aplicar Ajuste Manual y Actualizar Pseudosección")
+
+        # Aplicar el filtro activo a una copia limpia
         data_clean = pg.DataContainerERT(data_raw)
-        invalid_mask = (data_clean["rhoa"] < rhoa_min) | (data_clean["rhoa"] > rhoa_max)
+        invalid_mask = (data_clean["rhoa"] < (rhoa_min - 1e-4)) | (data_clean["rhoa"] > (rhoa_max + 1e-4))
+        n_descartadas_actual = int(np.sum(invalid_mask))
         data_clean.markInvalid(invalid_mask)
         data_clean.removeInvalid()
         data_clean["err"] = ert.estimateError(
             data_clean, relativeError=err_est / 100.0, absoluteUError=5e-5
         )
-
-        st.caption(f"Lecturas válidas tras el filtro: **{data_clean.size()}** de {data_raw.size()}")
-
-        fig_pseudo, ax_p = plt.subplots(figsize=(8, 3.2))
-        ert.show(data_clean, ax=ax_p, cMap="Spectral_r", label="ρa (Ω·m)")
-        ax_p.set_title(f"Pseudosección de Resistividad Aparente - {seccion_activa}")
-        st.pyplot(fig_pseudo)
-        plt.close(fig_pseudo)
 
     with col_geo:
         st.subheader("Georreferenciación UTM de la Línea")
@@ -444,9 +540,75 @@ with tab_qc:
         azimut = (np.degrees(np.arctan2(x_fin - x_ini, y_fin - y_ini)) + 360) % 360
         st.info(f"📏 **Longitud en planta:** {dist_utm:.1f} m | 🧭 **Azimut:** {azimut:.1f}°")
 
+        if seccion_activa in st.session_state["crs_datasets"]:
+            df_crs = st.session_state["crs_datasets"][seccion_activa]
+            if not df_crs.empty:
+                with st.expander("📊 Ver Resistencia de Contacto (.crs)", expanded=True):
+                    fig_crs = go.Figure(
+                        go.Bar(
+                            x=df_crs.iloc[:, 0],
+                            y=df_crs.iloc[:, -1],
+                            marker_color="teal",
+                            name="Resistencia de Contacto",
+                        )
+                    )
+                    fig_crs.update_layout(
+                        height=220,
+                        xaxis_title="Electrodo / Par",
+                        yaxis_title="Resistencia (Ω)",
+                        margin=dict(l=20, r=20, t=20, b=20),
+                    )
+                    st.plotly_chart(fig_crs, use_container_width=True)
+
+    # --------------------------------------------------------------------------
+    # COMPARATIVA DE PSEUDOSECCIONES: ORIGINAL (CRUDA) VS. ACTUALIZADA (FILTRADA)
+    # --------------------------------------------------------------------------
+    st.divider()
+    st.subheader("📊 Comparativa de Pseudosecciones: Datos Originales vs. Datos Filtrados")
+
+    c_stat1, c_stat2, c_stat3 = st.columns(3)
+    c_stat1.metric("Lecturas Originales", f"{data_raw.size()}")
+    c_stat2.metric("Lecturas Válidas Activas", f"{data_clean.size()}")
+    c_stat3.metric(
+        "Lecturas Descartadas por el Filtro",
+        f"{n_descartadas_actual} ({(n_descartadas_actual / max(1, data_raw.size())) * 100:.1f}%)"
+    )
+
+    modo_vista_pseudo = st.radio(
+        "Disposición visual de las pseudosecciones:",
+        options=["Lado a Lado (2 Columnas)", "Apiladas Verticalmente (Alineación exacta en distancia)"],
+        index=0,
+        horizontal=True,
+    )
+
+    if modo_vista_pseudo.startswith("Lado a Lado"):
+        p_col1, p_col2 = st.columns(2)
+    else:
+        p_col1 = st.container()
+        p_col2 = st.container()
+
+    with p_col1:
+        fig_raw, ax_raw = plt.subplots(figsize=(8, 3.3))
+        ert.show(data_raw, ax=ax_raw, cMap="Spectral_r", label="ρa Original (Ω·m)")
+        ax_raw.set_title(
+            f"1. ORIGINAL (Sin filtro): {data_raw.size()} lecturas [{np.min(rhoa_orig):.1f} - {np.max(rhoa_orig):.1f} Ω·m]"
+        )
+        st.pyplot(fig_raw)
+        plt.close(fig_raw)
+
+    with p_col2:
+        fig_clean, ax_clean = plt.subplots(figsize=(8, 3.3))
+        rhoa_clean_arr = np.array(data_clean["rhoa"])
+        ert.show(data_clean, ax=ax_clean, cMap="Spectral_r", label="ρa Filtrada (Ω·m)")
+        ax_clean.set_title(
+            f"2. ACTUALIZADA (Filtrada): {data_clean.size()} lecturas [{np.min(rhoa_clean_arr):.1f} - {np.max(rhoa_clean_arr):.1f} Ω·m]"
+        )
+        st.pyplot(fig_clean)
+        plt.close(fig_clean)
+
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 2: INVERSIÓN 2D (ESTILO LIBRO / EARTHIMAGER CON VALORES EN Ω·m)
+# PESTAÑA 2: INVERSIÓN 2D (PROFUNDIDAD COMPLETA Y VALORES EN Ω·m)
 # ------------------------------------------------------------------------------
 with tab_inv:
     col_params, col_plot = st.columns([1, 2.35])
@@ -454,7 +616,7 @@ with tab_inv:
     with col_params:
         with st.form(key=f"form_inv_{seccion_activa}"):
             st.subheader("Parámetros de Inversión")
-            lam = st.slider("Regularización (λ - Suavizado)", 1.0, 150.0, 20.0, 1.0)
+            lam = st.slider("Regularización (λ - Suavizado)", 1.0, 150.0, 15.0, 1.0)
             z_weight = st.slider("Anisotropía Estructural (zWeight)", 0.05, 1.0, 0.3, 0.05)
             tipo_inv = st.radio(
                 "Esquema de Inversión (Estilo EarthImager)",
@@ -467,14 +629,28 @@ with tab_inv:
             )
             c_m1, c_m2 = st.columns(2)
             para_dx = c_m1.selectbox("Refinamiento de celda", [0.5, 0.33, 0.25], index=1)
-            max_depth = c_m2.number_input("Prof. Máx (0=Auto)", value=0.0, min_value=0.0, step=10.0)
+            max_depth = c_m2.number_input("Prof. Máx (m)", value=68.0, min_value=0.0, step=5.0)
             max_iter = st.slider("Iteraciones máximas", 3, 20, 10)
-            cov_threshold = st.slider("Recorte de Sensibilidad (DOI)", -3.0, 0.0, -1.2, 0.1)
+            cov_threshold = st.slider("Umbral DOI (Sensibilidad)", -3.5, 0.0, -2.5, 0.1)
 
             btn_invertir = st.form_submit_button("🚀 Ejecutar Inversión y Actualizar 3D", type="primary")
 
         st.divider()
         st.subheader("🎨 Opciones de Visualización (Ω·m)")
+        eje_vertical_modo = st.radio(
+            "Eje Vertical de la Sección:",
+            options=[
+                "Profundidad bajo terreno (m) [0 a -70 m]",
+                "Elevación Topográfica (msnm)",
+            ],
+            index=0,
+        )
+        exag_2d = st.slider("Exageración Vertical 2D", 0.5, 4.0, 1.8, 0.1)
+        usar_recorte_doi = st.checkbox(
+            "Recortar zonas de baja sensibilidad (DOI)",
+            value=False,
+            help="Desactivado muestra el trapecio completo hasta la profundidad máxima (Estilo EarthImager)."
+        )
         modo_escala = st.radio(
             "Distribución de Color (Etiquetas siempre en Ω·m):",
             options=[
@@ -526,26 +702,45 @@ with tab_inv:
 
         with col_plot:
             mod = st.session_state["modelos_geofisicos"][seccion_activa]
-            k1, k2, k3 = st.columns(3)
+            prof_alcanzada = float(elec_z.max() - mod["nodes_2d"][:, 1].min())
+            k1, k2, k3, k4 = st.columns(4)
             k1.metric("Error RMS Relativo", f"{mod['metrics']['rms_rel']:.2f} %")
-            k2.metric("Ajuste χ² (Chi-Cuadrada)", f"{mod['metrics']['chi2']:.2f}")
-            k3.metric("Celdas Activas", mod["metrics"]["n_cells"])
+            k2.metric("Ajuste χ²", f"{mod['metrics']['chi2']:.2f}")
+            k3.metric("Profundidad Malla", f"{prof_alcanzada:.1f} m")
+            k4.metric("Celdas Activas", mod["metrics"]["n_cells"])
 
-            # Rango de resistividad en Ω·m reales para controlar la barra de color
-            mask_valid = mod["centers_cov"] >= cov_threshold
-            res_valid_ohm = mod["centers_res"][mask_valid]
-            p5 = float(np.percentile(res_valid_ohm, 2))
-            p95 = float(np.percentile(res_valid_ohm, 98))
+            res_valid_ohm = mod["centers_res"]
+            r_min_inv = float(np.floor(np.min(res_valid_ohm) * 10.0) / 10.0)
+            r_max_inv = float(np.ceil(np.max(res_valid_ohm) * 10.0) / 10.0)
 
             c_r1, c_r2 = st.columns(2)
-            r_min_user = c_r1.number_input("Mínimo Barra de Color (Ω·m)", value=round(max(0.5, p5), 1), step=1.0)
-            r_max_user = c_r2.number_input("Máximo Barra de Color (Ω·m)", value=round(max(10.0, p95), 1), step=10.0)
-
-            # Interpolación suave 2D estilo EarthImager / Libro
-            d_grid, z_grid, rho_grid, log_rho_grid = interpolar_malla_suave_2d(
-                mod["centers_2d"], mod["centers_res"], mod["centers_cov"],
-                elec_d, elec_z, z_offset, cov_threshold
+            r_min_user = c_r1.number_input(
+                "Mínimo Barra de Color (Ω·m)",
+                value=max(0.1, r_min_inv),
+                step=1.0,
+                key=f"cmin2d_{seccion_activa}",
             )
+            r_max_user = c_r2.number_input(
+                "Máximo Barra de Color (Ω·m)",
+                value=max(10.0, r_max_inv),
+                step=10.0,
+                key=f"cmax2d_{seccion_activa}",
+            )
+
+            d_grid, z_grid_msnm, rho_grid, log_rho_grid = interpolar_malla_suave_2d(
+                mod["centers_2d"], mod["centers_res"], mod["centers_cov"],
+                elec_d, elec_z, z_offset, cov_threshold, usar_recorte_doi=usar_recorte_doi
+            )
+
+            cota_superficie = float(np.mean(elec_z + z_offset))
+            if eje_vertical_modo.startswith("Profundidad"):
+                y_grid_plot = z_grid_msnm - cota_superficie
+                y_elecs_plot = (elec_z + z_offset) - cota_superficie
+                y_label = "Profundidad (m)"
+            else:
+                y_grid_plot = z_grid_msnm
+                y_elecs_plot = elec_z + z_offset
+                y_label = "Elevación (msnm)"
 
             fig_smooth = go.Figure()
 
@@ -554,7 +749,7 @@ with tab_inv:
                 fig_smooth.add_trace(
                     go.Contour(
                         x=d_grid,
-                        y=z_grid,
+                        y=y_grid_plot,
                         z=log_rho_grid,
                         customdata=rho_grid,
                         zmin=np.log10(r_min_user),
@@ -565,7 +760,7 @@ with tab_inv:
                             showlines=mostrar_isolineas,
                             start=np.log10(r_min_user),
                             end=np.log10(r_max_user),
-                            size=(np.log10(r_max_user) - np.log10(r_min_user)) / 12.0,
+                            size=(np.log10(r_max_user) - np.log10(r_min_user)) / 14.0,
                         ),
                         line=dict(width=0.6, color="rgba(0,0,0,0.35)"),
                         colorbar=dict(
@@ -575,18 +770,17 @@ with tab_inv:
                         ),
                         hovertemplate=(
                             "<b>Distancia:</b> %{x:.1f} m<br>"
-                            "<b>Elevación:</b> %{y:.1f} msnm<br>"
+                            f"<b>{y_label}:</b> %{{y:.1f}} m<br>"
                             "<b>Resistividad:</b> %{customdata:.1f} Ω·m<extra></extra>"
                         ),
                         name="TRE Suavizada",
                     )
                 )
             else:
-                # Escala Lineal Directa en Ω·m
                 fig_smooth.add_trace(
                     go.Contour(
                         x=d_grid,
-                        y=z_grid,
+                        y=y_grid_plot,
                         z=rho_grid,
                         zmin=r_min_user,
                         zmax=r_max_user,
@@ -596,48 +790,54 @@ with tab_inv:
                             showlines=mostrar_isolineas,
                             start=r_min_user,
                             end=r_max_user,
-                            size=(r_max_user - r_min_user) / 12.0,
+                            size=(r_max_user - r_min_user) / 14.0,
                         ),
                         line=dict(width=0.6, color="rgba(0,0,0,0.35)"),
                         colorbar=dict(title="Resistividad (Ω·m)", ticksuffix=" Ω·m"),
                         hovertemplate=(
                             "<b>Distancia:</b> %{x:.1f} m<br>"
-                            "<b>Elevación:</b> %{y:.1f} msnm<br>"
+                            f"<b>{y_label}:</b> %{{y:.1f}} m<br>"
                             "<b>Resistividad:</b> %{z:.1f} Ω·m<extra></extra>"
                         ),
                         name="TRE Lineal",
                     )
                 )
 
-            # Superponer electrodos y perfil topográfico
             fig_smooth.add_trace(
                 go.Scatter(
                     x=elec_d,
-                    y=elec_z + z_offset,
+                    y=y_elecs_plot,
                     mode="markers+lines",
                     marker=dict(symbol="triangle-down", size=7, color="black"),
                     line=dict(color="black", width=1.5),
                     name="Electrodos",
-                    hovertemplate="Electrodo en %{x:.1f} m (Z=%{y:.1f} msnm)<extra></extra>",
                 )
             )
 
+            valid_rows = ~np.all(np.isnan(rho_grid), axis=1)
+            y_min_valid = float(np.nanmin(y_grid_plot[valid_rows])) if np.any(valid_rows) else float(np.min(y_grid_plot))
+            y_max_valid = float(np.nanmax(y_elecs_plot)) + 3.0
+
             fig_smooth.update_layout(
-                title=f"Sección Geoeléctrica Invertida (Contornos Suavizados en Ω·m) — {seccion_activa}",
+                title=f"Sección Geoeléctrica Invertida ({prof_alcanzada:.0f} m de prof.) — {seccion_activa}",
                 xaxis_title="Distancia sobre la línea (m)",
-                yaxis_title="Elevación (msnm)",
-                height=480,
-                yaxis=dict(scaleanchor="x", scaleratio=1.2),
+                yaxis_title=y_label,
+                height=520,
+                xaxis=dict(range=[elec_d.min() - 2, elec_d.max() + 2]),
+                yaxis=dict(
+                    range=[y_min_valid - 2, y_max_valid],
+                    scaleanchor="x",
+                    scaleratio=exag_2d,
+                ),
                 margin=dict(l=20, r=20, t=45, b=20),
                 legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
             )
             st.plotly_chart(fig_smooth, use_container_width=True)
 
-            # Vista adicional lista para exportar a informe técnico en alta resolución
             with st.expander("📄 Ver / Descargar Figura para Informe Técnico (Renderizado Gouraud)", expanded=False):
                 fig_pub, ax_pub = plt.subplots(figsize=(10, 3.6), dpi=200)
                 cf = ax_pub.contourf(
-                    d_grid, z_grid, rho_grid,
+                    d_grid, y_grid_plot, rho_grid,
                     levels=np.geomspace(r_min_user, r_max_user, 24)
                     if modo_escala.startswith("Proporcional")
                     else np.linspace(r_min_user, r_max_user, 24),
@@ -645,12 +845,12 @@ with tab_inv:
                     extend="both",
                 )
                 if mostrar_isolineas:
-                    ax_pub.contour(d_grid, z_grid, rho_grid, levels=cf.levels[::2], colors="k", linewidths=0.35, alpha=0.5)
-                ax_pub.plot(elec_d, elec_z + z_offset, "kv", markersize=4, label="Electrodos")
+                    ax_pub.contour(d_grid, y_grid_plot, rho_grid, levels=cf.levels[::2], colors="k", linewidths=0.35, alpha=0.5)
+                ax_pub.plot(elec_d, y_elecs_plot, "kv", markersize=4, label="Electrodos")
                 ax_pub.set_xlabel("Distancia (m)")
-                ax_pub.set_ylabel("Elevación (msnm)")
+                ax_pub.set_ylabel(y_label)
                 ax_pub.set_title(f"Tomografía de Resistividad Eléctrica: {seccion_activa} (RMS: {mod['metrics']['rms_rel']:.1f}%)")
-                ax_pub.set_aspect(1.2)
+                ax_pub.set_aspect(exag_2d)
                 cbar = fig_pub.colorbar(cf, ax=ax_pub, pad=0.02)
                 cbar.set_label("Resistividad (Ω·m)")
                 cbar.formatter = ticker.FormatStrFormatter("%.0f")
@@ -725,7 +925,6 @@ with tab_3d:
                 tris_v = m["triangles"][mask_doi]
 
                 if suavizado_3d:
-                    # Suavizado por vértice (sin aspecto de triángulos escalonados)
                     intensidad = np.log10(np.clip(m["node_res"], 0.1, 1e5))
                     modo_int = "vertex"
                     vals_reales_hover = m["node_res"]
